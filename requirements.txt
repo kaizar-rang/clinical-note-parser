@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+spacy
+transformers
+openai
+python-dotenv
+tqdm
