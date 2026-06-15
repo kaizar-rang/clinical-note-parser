@@ -1,201 +1,183 @@
-"""
-MRI report splitter.
-
-Takes the raw `findings` column from mri_reports.csv and splits each report
-into individual finding paragraphs, then filters noise and tags negatives
-and extracranial paragraphs.
-
-Pipeline:
-    mri_reports.csv
-        → load_structural()       -- filter to usable structural brain MRI rows
-        → split_and_filter()      -- paragraph split + noise removal + tagging
-        → mri_findings_split.csv  -- one row per finding, ready for extractor.py
-
-Splitting strategy (validated via EDA on 36,924 reports):
-
-    1. Multi-section detection: ~5.1% of reports combine BRAIN MRI + HEAD MRA
-       + NECK MRA in one findings block. These are split on section headers and
-       only the BRAIN MRI section is kept. Without this step, MRA vessel findings
-       flood the output with non-brain content.
-
-    2. Paragraph splitting: double newline (\n\n) is the primary boundary.
-       99.2% of reports use this convention. Single-newline-only reports (0.8%)
-       are left as one unit -- they are typically compact single-finding prose
-       that the LLM extractor handles correctly without splitting.
-
-    3. Minimum length filter: paragraphs under 30 chars are dropped. These are
-       section sub-headers, lone punctuation, or stubs.
-
-Noise filter categories (hard drop):
-    - Too short (<30 chars)
-    - Section headers: "BRAIN MRI:", "NECK MRA:", "ANTERIOR CIRCULATION"
-    - Boilerplate/admin: automated system notifications, attending sign-off
-    - Technical notes: "study terminated", "motion artifact limits evaluation"
-
-Soft tags (kept but flagged for downstream filtering):
-    - is_negative:     normal/negative findings, nothing to highlight in VXP
-                       but useful as ground truth for the teaching tool
-    - is_extracranial: non-brain structures (sinuses, mastoids, cervical vessels)
-                       VXP cannot annotate these on a structural brain MRI
-"""
 import re
 import pandas as pd
-from utils.filters import is_noise, is_negative, is_extracranial
 
-STRUCTURAL_TYPES = [
-    'MRI BRAIN',
-    'MRI BRAIN WITH AND WITHOUT CONTRAST',
-    'MRI BRAIN WITHOUT CONTRAST',
-]
+# ── Filters v8 ────────────────────────────────────────────────────────────────
 
-# Matches the start of a new named section in multi-modality reports
+BOILERPLATE_PATTERN = re.compile(
+    r'forwarded to an automated communication'
+    r'|findings were (?:discussed|communicated)'
+    r'|(?:the )?(?:critical )?findings in this report were reported to'
+    r'|who responded indicating that the communication was understood'
+    r'|alert notification of critical'
+    r'|critical results were communicated'
+    r'|this report has been'
+    r'|electronically notify'
+    r'|per epic note'
+    r'|carotid stenosis reference'
+    r'|(?:\[redacted\][\w\s,\.]*)?(?:md|do|phd|np|pa)[\s,]+the (?:attending|teaching) physician'
+    r'|i,? the (?:attending|teaching) physician'
+    r'|have reviewed the images and agree'
+    r'|study (?:terminated|aborted|discontinued) (?:early|due to|at patient)'
+    r'|post contrast[:\s]+following (?:iv|intravenous) administration'
+    r'|following (?:iv|intravenous) administration of (?:gadolinium|contrast)'
+    r'|(?:exam|study|images?|sequences?|imaging quality|image quality) (?:is|are) (?:limited|degraded) (?:by|due to|secondary to) (?:motion|artifact|patient)'
+    r'|(?:patient was not able|patient could not) (?:to )?tolerate'
+    r'|(?:patient was )?removed from the magnet'
+    r'|only (?:diffusion|flair|dwi|t1|t2)[\w\s]+ (?:sequence|sequences|images?) (?:were|was) obtained'
+    r'|(?:images?|sequences?) (?:are|were|is) degraded by'
+    r'|pending postprocessing at the time of this dictation'
+    r'|perfusion images? (?:are )?pending'
+    r'|study quality is limited'
+    r'|there is motion artifact'
+    r'|(?:asl|dwi) sequence is nondiagnostic'
+    r'|you can find out more about our efforts'
+    r'|visiting \[redacted\]'
+    r'|suboptimal evaluation (?:for|of|secondary to).{0,60}(?:motion|artifact|technique)'
+    r'|follow.?up (?:is )?recommended'
+    r'|contact was made at the time of interpr'
+    r'|(?:communicated|documented) via(?: a)? closed.?loop communication'
+    r'|(?:results? were|findings? were) communicated to the referring (?:provider|physician|clinician)s? via'
+    r'|communicated to the referring providers? via \w+'
+    r'|(?:swan|t2 star|t2\*).{0,40}(?:motion degraded|markedly.{0,10}degraded|nondiagnostic)',
+    re.IGNORECASE
+)
+
+HEADER_PATTERN = re.compile(
+    r'^(?:brain mri|head mra|neck mra|mri brain|intracranial mra'
+    r'|anterior circulation|posterior circulation|collateral circulation'
+    r'|aortic\s+\[redacted\].*origin of major cervical'
+    r'|impression|technique|comparison|indication|methodology'
+    r'|detail|findings|neck'
+    r'|ventricular system[\w\s\-]+:'
+    r'|extra-axial spaces?:'
+    r'|brain parenchyma:'
+    r'|vascular system:'
+    r'|vascular structures?:'
+    r'|extracranial structures?:?'
+    r'|flow.related signal'
+    r'|synopsis for clinical management'
+    r'|miscellaneous:'
+    r'|calvarium:'
+    r'|anterior circulation:):?\s*$',
+    re.IGNORECASE
+)
+
+NEGATIVE_PATTERN = re.compile(
+    r'^(?:there (?:is|are) )?(?:no evidence of|no acute|no new|no abnormal'
+    r'|no significant|unremarkable|within normal limits|no hemorrhage'
+    r'|no infarct|no mass effect|no hydrocephalus|no midline shift'
+    r'|no space.occupying|no enhancing lesion|no abnormal enhancement'
+    r'|no restricted diffusion|no acute intracranial|no brain parenchymal mass'
+    r'|no interval change|no intracranial mass|no mass lesion'
+    r'|no gross abnormalities)'
+    r'|^(?:the )?(?:intracranial )?(?:major )?(?:flow.?voids?|arterial flow voids|vessels).{0,60}(?:intact|preserved|patent|maintained|present)'
+    r'|^intracranial (?:major )?(?:dural sinus and )?arterial flow voids are present'
+    r'|^flow.related signal is observed.{0,120}without (?:occlusion|stenosis)'
+    r'|^the (?:visualized )?(?:paranasal sinuses|mastoid air cells?|orbits|bones and extracranial|extracranial soft tissues).{0,80}(?:clear|normal|unremarkable|unchanged)'
+    r'|^the (?:remaining )?ventricles? (?:are|is) (?:stable|normal|unremarkable|unchanged)'
+    r'|^(?:the )?ventricles?[,\s]+sulci[,\s]+and (?:cisterns?|basal cisterns?).{0,60}(?:unremarkable|normal|stable|within normal limits)'
+    r'|^ventricles?[,\s]+sulci[,\s]+and cisterns? are stable'
+    r'|^there has been no (?:significant )?interval change in (?:size|the size)'
+    r'|^(?:\[redacted\]\s+)?venous sinuses? (?:enhance|are|appear).{0,40}(?:normal|patent|intact|homogenous)'
+    r'|^vascular system:.{0,120}(?:intact|preserved|patent|normal|homogenous)'
+    r'|^(?:extracranial structures|paranasal sinuses|mastoid).{0,80}(?:clear|normal|unremarkable)'
+    r'|^(?:otherwise,?\s+)?the bones(?: and extracranial soft tissues)?.{0,60}(?:unremarkable|normal|unchanged)'
+    r'|^(?:post contrast|following contrast).{0,60}no (?:abnormal|significant)'
+    r'|^(?:there are )?no regions of abnormal restricted diffusivity'
+    r'|^diffusion.weighted imaging demonstrates no acute'
+    r'|^diffusion shows no signal abnormality'
+    r'|^asl (?:sequence )?does not show'
+    r'|^calvarium:.{0,60}(?:normal|within normal limits|unremarkable)',
+    re.IGNORECASE
+)
+
+EXTRACRANIAL_PATTERN = re.compile(
+    r'^(?:paranasal sinuses|mastoid air cells?|orbits|skull base'
+    r'|extracranial soft tissues|cervical|vertebral arter'
+    r'|aortic|subclavian|carotid|nasopharynx|external carotid'
+    r'|mra\s+\[?redacted\]?)'
+    r'|^(?:otherwise,?\s+)?the bones'
+    r'|^the (?:visualized )?(?:paranasal sinuses|mastoid|orbits)'
+    r'|^the (?:intracranial )?vertebral arteries'
+    r'|^(?:partial|bilateral|mild|moderate|severe|minimal|scattered)?\s*(?:opacification|thickening|mucosal).{0,40}(?:sinus|mastoid|orbit)'
+    r'|(?:mastoid air cells?|middle ear cav|maxillary sinus|sphenoid sinus|ethmoid sinus|paranasal sinus).{0,50}(?:opacif|thicken|fluid|effusion|clear|normal|air cell)'
+    r'|(?:superior sagittal|transverse sinus|sigmoid sinus|straight sinus|cavernous sinus|dural (?:venous )?sinus|venous sinus).{0,80}(?:patent|thrombus|laceration|signal|enhance|filling defect|persistent|resolution|confluence)'
+    r'|(?:nasopharynx|pharynx).{0,60}(?:edema|mucosal|thickening|fluid)'
+    r'|(?:edema|mucosal thickening).{0,40}(?:nasopharynx|pharynx)'
+    r'|(?:spinal canal|neuroforaminal|neural foramen|spinal cord|cauda equina|conus terminates|c\d-\d|l\d[ -]|cervical spine|thoracic spine|cervicomedullary)'
+    r'|^(?:the )?(?:intracranial vertebral arteries|basilar artery).{0,40}(?:patent|normal)'
+    r'|^(?:left|right)? vertebral artery (?:demonstrates|shows)'
+    r'|^(?:the )?intracranial (?:ica|internal carotid).{0,80}(?:normal|patent|caliber)'
+    r'|^(?:the )?(?:anterior|middle|posterior) cerebral arter.{0,60}(?:normal|patent|caliber)'
+    r'|^(?:in )?the circle of.{0,80}(?:patent|atherosclerotic|anterior|posterior)'
+    r'|^anterior circulation:'
+    r'|^(?:no )?hemodynamically.significant stenosis'
+    r'|(?:aortic arch|three.vessel arch|subclavian arter|vertebral arter(?:ies)? arise)'
+    r'|(?:extracranial and intracranial|extracranial).{0,40}(?:internal carotid|carotid artery|vertebral)'
+    r'|(?:flow.related enhancement|flow related enhancement).{0,60}(?:internal carotid|carotid|vertebral|middle cerebral)'
+    r'|(?:\bright\b|\bleft\b|\bbilateral\b)?\s*(?:parietal bone|frontal bone|occipital bone|temporal bone|sphenoid bone|ethmoid bone)'
+    r'|(?:calvarium|calvarial).{0,60}(?:focus|lesion|metastas|hyperintens|signal)'
+    r'|(?:maxillary sinus|sphenoid sinus|ethmoid).{0,80}(?:asymmetr|diminutive|bowing|deviat|retention cyst)'
+    r'|(?:nasogastric|nasoenteric|feeding).{0,30}(?:tube|ng tube).{0,60}(?:oropharynx|pharynx|stomach|esophagus|coiled|positioned)'
+    r'|(?:oropharynx|pharynx).{0,60}(?:tube|coiled)',
+    re.IGNORECASE
+)
+
+INLINE_SUBSECTION_PATTERN = re.compile(
+    r'^(?:brain parenchyma|ventricular system[\w\s\-]*|extra-axial spaces?'
+    r'|vascular system|extracranial structures?|calvarium|miscellaneous'
+    r'|synopsis for clinical management)\s*:\s*',
+    re.IGNORECASE
+)
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def strip_inline_header(text: str) -> str:
+    return INLINE_SUBSECTION_PATTERN.sub('', text).strip()
+
+def is_noise(t: str) -> bool:
+    if len(t.strip()) < 30:
+        return True
+    if HEADER_PATTERN.match(t):
+        return True
+    if BOILERPLATE_PATTERN.search(t):
+        return True
+    return False
+
+def is_negative(t: str) -> bool:
+    return bool(NEGATIVE_PATTERN.match(t))
+
+def is_extracranial(t: str) -> bool:
+    return bool(EXTRACRANIAL_PATTERN.search(t))
+
+# ── Splitter ──────────────────────────────────────────────────────────────────
+
 SECTION_SPLIT_PATTERN = re.compile(
     r'\n(?=(?:BRAIN MRI|HEAD MRA|NECK MRA|MRI BRAIN AND NECK'
     r'|SPINE|CERVICAL|THORACIC|LUMBAR|STRUCTURAL MRI|FUNCTIONAL MRI)\s*[:\n])',
     re.IGNORECASE
 )
-
-# Matches brain-relevant section headers to keep
-BRAIN_SECTION_PATTERN = re.compile(
-    r'^(?:BRAIN MRI|MRI BRAIN|STRUCTURAL MRI)',
-    re.IGNORECASE
-)
-
-# Inline section header at the start of a paragraph to strip
-INLINE_HEADER_PATTERN = re.compile(
-    r'^(?:BRAIN MRI|HEAD MRA|MRI BRAIN)\s*:?\s*\n',
-    re.IGNORECASE
-)
-
-
-def load_structural(csv_path: str) -> pd.DataFrame:
-    """
-    Load mri_reports.csv and filter to usable structural brain MRI rows.
-
-    Drops:
-        - Rows with missing or stub findings ("not available", "none", "")
-        - Non-structural scan types (PET, functional, angio, intraop)
-    """
-    mri = pd.read_csv(csv_path, engine='python', on_bad_lines='skip')
-
-    valid = mri[
-        mri['findings'].notna() &
-        ~mri['findings'].str.strip().str.lower().isin(['not available', 'none', ''])
-    ]
-
-    structural = valid[valid['Type'].isin(STRUCTURAL_TYPES)].copy()
-
-    print(f'Total MRI rows:           {len(mri):,}')
-    print(f'Usable rows:              {len(valid):,}')
-    print(f'Structural brain MRI:     {len(structural):,}')
-    print(f'Unique patients:          {structural["bdsp_patient_id"].nunique():,}')
-    print(f'Unique sessions:          {structural["session_id"].nunique():,}')
-
-    return structural
+BRAIN_SECTION_PATTERN = re.compile(r'^(?:BRAIN MRI|MRI BRAIN|STRUCTURAL MRI)', re.IGNORECASE)
+INLINE_HEADER_PATTERN = re.compile(r'^(?:BRAIN MRI|HEAD MRA|MRI BRAIN)\s*:?\s*\n', re.IGNORECASE)
 
 
 def _extract_brain_section(text: str) -> str:
-    """
-    For multi-section reports (BRAIN MRI + HEAD MRA + NECK MRA etc.),
-    extract only the BRAIN MRI section. Returns the full text unchanged
-    for single-section reports.
-    """
     if not SECTION_SPLIT_PATTERN.search(text):
         return text
-
     sections = SECTION_SPLIT_PATTERN.split(text)
-    brain_sections = [s for s in sections if BRAIN_SECTION_PATTERN.match(s.strip())]
-
-    # If we found a brain section, use it. Otherwise fall back to full text
-    # (avoids losing reports where the brain content comes before any header)
-    return brain_sections[0] if brain_sections else sections[0]
+    brain = [s for s in sections if BRAIN_SECTION_PATTERN.match(s.strip())]
+    return brain[0] if brain else sections[0]
 
 
 def split_report(text: str) -> list[str]:
-    """
-    Split a single findings text into individual finding paragraphs.
-
-    Strategy:
-        1. Extract brain section only (handles multi-modality reports)
-        2. Split on double newlines
-        3. Strip inline section headers from paragraph starts
-        4. Drop paragraphs under 30 chars
-    """
+    """Split a findings string into cleaned paragraphs."""
     if pd.isna(text):
         return []
-
     text = _extract_brain_section(text)
-
-    paragraphs = re.split(r'\n[ \t]*\n', text)
-
     result = []
-    for p in paragraphs:
-        p = p.strip()
-        p = INLINE_HEADER_PATTERN.sub('', p).strip()
+    for p in re.split(r'\n[ \t]*\n', text):
+        p = INLINE_HEADER_PATTERN.sub('', p.strip()).strip()
+        p = strip_inline_header(p)
         if len(p) >= 30:
             result.append(p)
-
     return result
-
-
-def split_and_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Explode each MRI report into individual finding paragraphs,
-    apply noise filters, and tag negatives and extracranial findings.
-
-    Args:
-        df: Output of load_structural() -- one row per MRI session
-
-    Returns:
-        DataFrame with one row per finding paragraph, columns:
-            bdsp_patient_id  -- patient identifier
-            session_id       -- session identifier (one visit)
-            Type             -- MRI scan type
-            paragraph        -- individual finding text
-            is_negative      -- True if normal/negative finding
-            is_extracranial  -- True if describes non-brain structures
-    """
-    df = df.copy()
-
-    df['paragraph_list'] = df['findings'].apply(split_report)
-    exploded = (
-        df.explode('paragraph_list')
-        .rename(columns={'paragraph_list': 'paragraph'})
-        .dropna(subset=['paragraph'])
-        .reset_index(drop=True)
-    )
-
-    # Hard drop: noise paragraphs
-    noise_mask = exploded['paragraph'].apply(is_noise)
-    filtered = exploded[~noise_mask].copy().reset_index(drop=True)
-
-    # Soft tags
-    filtered['is_negative'] = filtered['paragraph'].apply(is_negative)
-    filtered['is_extracranial'] = filtered['paragraph'].apply(is_extracranial)
-
-    positive = (~filtered['is_negative'] & ~filtered['is_extracranial']).sum()
-
-    print(f'\nSplit summary:')
-    print(f'  Total paragraphs:            {len(exploded):,}')
-    print(f'  Dropped (noise):             {noise_mask.sum():,}')
-    print(f'  Remaining:                   {len(filtered):,}')
-    print(f'    - Negative/normal:         {filtered["is_negative"].sum():,}')
-    print(f'    - Extracranial:            {filtered["is_extracranial"].sum():,}')
-    print(f'    - Positive brain findings: {positive:,}')
-
-    return filtered
-
-
-if __name__ == "__main__":
-    import os
-    from config import MRI_CSV
-
-    os.makedirs('data', exist_ok=True)
-
-    structural = load_structural(MRI_CSV)
-    findings = split_and_filter(structural)
-
-    out_cols = ['bdsp_patient_id', 'session_id', 'Type', 'paragraph', 'is_negative', 'is_extracranial']
-    out_path = 'data/mri_findings_split.csv'
-    findings[out_cols].to_csv(out_path, index=False)
-    print(f'\nSaved: {out_path}')
