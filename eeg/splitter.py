@@ -157,3 +157,26 @@ def split_report(row: pd.Series) -> str | None:
     elif report_type == 'emu':
         return split_emu(text)
     return None
+
+# ---------------------------------------------------------------------------
+# Batch entrypoint (offline pipeline)
+# ---------------------------------------------------------------------------
+
+def split_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run split_report over the full EEG dataframe.
+    Produces one output row per input row with a finding_text column added.
+    """
+    df = df.copy()
+    df['finding_text'] = df.apply(split_report, axis=1)
+    valid = df['finding_text'].notna().sum()
+    print(f'Extracted: {valid:,} / {len(df):,} reports ({100*valid/len(df):.1f}%)')
+    return df
+
+
+if __name__ == '__main__':
+    eeg = pd.read_csv('../data/eeg_reports.csv', engine='python', on_bad_lines='skip')
+    eeg = eeg[eeg['ServiceName'].isin(['Routine', 'LTM', 'EMU'])].copy()
+    result = split_dataframe(eeg)
+    result.to_csv('../data/eeg_findings_split.csv', index=False)
+    print('Saved: ../data/eeg_findings_split.csv')
