@@ -27,4 +27,4 @@ pip install -r requirements.txt
 - `clinical/` — Clinical note extraction, prompt formatting
 - `fusion/`   — Per-patient merging and final VXP prompt assembly
 - `utils/`    — Shared LLM wrapper, NLP helpers, noise filters
-- `notebooks/`— EDA notebooks
+- `notebooks/`— EDA & Testing notebooks
